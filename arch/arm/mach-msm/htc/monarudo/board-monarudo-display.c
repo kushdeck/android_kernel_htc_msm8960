@@ -77,6 +77,17 @@ const size_t ptype_len = ( 60 - sizeof("PANEL type = "));
 #define HDMI_PANEL_NAME "hdmi_msm"
 #define TVOUT_PANEL_NAME "tvout_msm"
 
+typedef struct dsi_cmd_t {
+  struct dsi_cmd_desc *cmds;
+  int count;
+} dsi_cmd;
+
+static dsi_cmd video_on_c;
+static dsi_cmd display_on_c;
+static dsi_cmd display_off_c;
+static dsi_cmd backlight_c;
+int mipi_lcd_on = 1;
+
 static int monarudo_detect_panel(const char *name)
 {
 	if (!strncmp(name, HDMI_PANEL_NAME,
@@ -297,6 +308,30 @@ void __init monarudo_mdp_writeback(struct memtype_reserve* reserve_table)
 static bool resume_blk = false;
 static bool backlight_gpio_is_on = true;
 
+static int monarudo_send_display_cmds(dsi_cmd *cmd, bool clk_ctrl)
+{
+	int ret = 0;
+	struct dcs_cmd_req cmdreq;
+
+	if (cmd == NULL
+	    || (cmd->cmds == NULL)
+	    || (cmd->count <= 0))
+		return 0;
+
+	cmdreq.cmds = cmd->cmds;
+	cmdreq.cmds_cnt = cmd->count;
+	cmdreq.flags = CMD_REQ_COMMIT;
+	if (clk_ctrl)
+		cmdreq.flags |= CMD_CLK_CTRL;
+	cmdreq.rlen = 0;
+	cmdreq.cb = NULL;
+
+	ret = mipi_dsi_cmdlist_put(&cmdreq);
+	if (ret < 0)
+		pr_err("%s failed (%d)\n", __func__, ret);
+	return ret;
+}
+
 static void backlight_gpio_enable(bool on)
 {
 	PR_DISP_DEBUG("monarudo's %s: request on=%d currently=%d\n", __func__, on, backlight_gpio_is_on);
@@ -329,8 +364,7 @@ backlight_gpio_on(void)
 	backlight_gpio_enable(true);
 }
 
-static int mipi_lcd_on = 1;
-static bool dsi_power_on = false;
+static bool dsi_power_on;
 
 static int mipi_dsi_panel_power(int on)
 {
@@ -339,7 +373,9 @@ static int mipi_dsi_panel_power(int on)
 	int rc;
 	static bool bPanelPowerOn = false;
 
-	pr_debug("%s: on=%d\n", __func__, on);
+	printk(KERN_ERR "%s: on(%d)\n", __func__, on);
+	if (panel_type == PANEL_ID_NONE)
+		return -ENODEV;
 
 	if (!dsi_power_on) {
 		PR_DISP_DEBUG("monarudo's %s: powering on.\n", __func__);
@@ -399,7 +435,6 @@ static int mipi_dsi_panel_power(int on)
 			pr_err("enable lvs5 failed, rc=%d\n", rc);
 			return -ENODEV;
 		}
-
 		if (!mipi_lcd_on) {
 			hr_msleep(1);
 			gpio_set_value_cansleep(gpio37, 1);
@@ -411,9 +446,8 @@ static int mipi_dsi_panel_power(int on)
 
 		/* Workaround for 1mA */
 		msm_xo_mode_vote(wa_xo, MSM_XO_MODE_ON);
-		hr_msleep(10);
+		msleep(10);
 		msm_xo_mode_vote(wa_xo, MSM_XO_MODE_OFF);
-
 		bPanelPowerOn = true;
 	} else {
 		if (!bPanelPowerOn) return 0;
@@ -449,14 +483,6 @@ static struct mipi_dsi_platform_data mipi_dsi_pdata = {
 };
 
 static struct mipi_dsi_panel_platform_data *mipi_monarudo_pdata;
-
-static struct dsi_cmd_desc *video_on_cmds = NULL;
-static struct dsi_cmd_desc *display_on_cmds = NULL;
-static struct dsi_cmd_desc *display_off_cmds = NULL;
-
-static int video_on_cmds_count = 0;
-static int display_on_cmds_count = 0;
-static int display_off_cmds_count = 0;
 
 static char enter_sleep[2] = {0x10, 0x00}; /* DTYPE_DCS_WRITE */
 static char exit_sleep[2] = {0x11, 0x00}; /* DTYPE_DCS_WRITE */
@@ -546,13 +572,13 @@ static struct dsi_cmd_desc sony_display_off_cmds[] = {
 };
 
 static struct i2c_client *blk_pwm_client;
-static struct dcs_cmd_req cmdreq;
 
 static int monarudo_lcd_on(struct platform_device *pdev)
 {
-	struct msm_fb_data_type *mfd = platform_get_drvdata(pdev);
-	struct mipi_panel_info *mipi = &mfd->panel_info.mipi;
+	struct msm_fb_data_type *mfd;
+	struct mipi_panel_info *mipi;
 
+	mfd = platform_get_drvdata(pdev);
 	if (!mfd)
 		return -ENODEV;
 	if (mfd->key != MFD_KEY)
@@ -560,22 +586,11 @@ static int monarudo_lcd_on(struct platform_device *pdev)
 	if (mipi_lcd_on)
 		return 0;
 
-	PR_DISP_DEBUG("%s: turning on the display.\n", __func__);
-
-	if (mipi->mode == DSI_VIDEO_MODE) {
-		cmdreq.cmds = video_on_cmds;
-		cmdreq.cmds_cnt = video_on_cmds_count;
-		cmdreq.flags = CMD_REQ_COMMIT;
-		cmdreq.rlen = 0;
-		cmdreq.cb = NULL;
-
-		mipi_dsi_cmdlist_put(&cmdreq);
-
-		PR_DISP_INFO("%s\n", __func__);
-	}
+	mipi = &mfd->panel_info.mipi;
+	if (mipi->mode == DSI_VIDEO_MODE)
+		monarudo_send_display_cmds(&video_on_c, false);
 
 	mipi_lcd_on = 1;
-
 	return 0;
 }
 
@@ -589,18 +604,17 @@ static int monarudo_lcd_off(struct platform_device *pdev)
 		return -ENODEV;
 	if (mfd->key != MFD_KEY)
 		return -EINVAL;
+
 	if (!mipi_lcd_on)
 		return 0;
 
 	mipi_lcd_on = 0;
-
 	resume_blk = true;
 
 	PR_DISP_INFO("%s\n", __func__);
 
 	return 0;
 }
-
 
 static int __devinit monarudo_lcd_probe(struct platform_device *pdev)
 {
@@ -626,15 +640,8 @@ static int monarudo_display_on(struct platform_device *pdev)
 
 	PR_DISP_DEBUG("%s: turning on the display.\n", __func__);
 
-	cmdreq.cmds = display_on_cmds;
-	cmdreq.cmds_cnt = display_on_cmds_count;
-	cmdreq.flags = CMD_REQ_COMMIT;
-	cmdreq.rlen = 0;
-	cmdreq.cb = NULL;
+	monarudo_send_display_cmds(&display_on_c, (mfd && mfd->panel_info.type == MIPI_CMD_PANEL));
 
-	mipi_dsi_cmdlist_put(&cmdreq);
-
-	PR_DISP_INFO("%s\n", __func__);
 	return 0;
 }
 
@@ -644,15 +651,8 @@ static int monarudo_display_off(struct platform_device *pdev)
 
 	mfd = platform_get_drvdata(pdev);
 
-	cmdreq.cmds = display_off_cmds;
-	cmdreq.cmds_cnt = display_off_cmds_count;
-	cmdreq.flags = CMD_REQ_COMMIT;
-	cmdreq.rlen = 0;
-	cmdreq.cb = NULL;
+	monarudo_send_display_cmds(&display_off_c, (mfd && mfd->panel_info.type == MIPI_CMD_PANEL));
 
-	mipi_dsi_cmdlist_put(&cmdreq);
-
-	PR_DISP_INFO("%s\n", __func__);
 	return 0;
 }
 
@@ -716,13 +716,7 @@ static void monarudo_set_backlight(struct msm_fb_data_type *mfd)
 			pr_err("i2c write fail\n");
 	}
 
-	cmdreq.cmds = (struct dsi_cmd_desc*)&renesas_cmd_backlight_cmds;
-	cmdreq.cmds_cnt = 1;
-	cmdreq.flags = CMD_REQ_COMMIT;
-	cmdreq.rlen = 0;
-	cmdreq.cb = NULL;
-
-	mipi_dsi_cmdlist_put(&cmdreq);
+	monarudo_send_display_cmds(&backlight_c, false);
 
 	if((mfd->bl_level) == 0) {
 		PR_DISP_DEBUG("%s: disabling backlight\n", __func__);
@@ -876,12 +870,14 @@ static int __init mipi_video_sharp_init(void)
 
 	strncat(ptype, "PANEL_ID_DLX_SHARP_RENESAS", ptype_len);
 
-	video_on_cmds = sharp_video_on_cmds;
-	video_on_cmds_count = ARRAY_SIZE(sharp_video_on_cmds);
-	display_on_cmds = renesas_display_on_cmds;
-	display_on_cmds_count = ARRAY_SIZE(renesas_display_on_cmds);
-	display_off_cmds = sharp_display_off_cmds;
-	display_off_cmds_count = ARRAY_SIZE(sharp_display_off_cmds);
+	video_on_c.cmds = sharp_video_on_cmds;
+	video_on_c.count = ARRAY_SIZE(sharp_video_on_cmds);
+	display_on_c.cmds = renesas_display_on_cmds;
+	display_on_c.count = ARRAY_SIZE(renesas_display_on_cmds);
+	display_off_c.cmds = sharp_display_off_cmds;
+	display_off_c.count = ARRAY_SIZE(sharp_display_off_cmds);
+	backlight_c.cmds = renesas_cmd_backlight_cmds;
+	backlight_c.count = ARRAY_SIZE(renesas_cmd_backlight_cmds);
 
 	PR_DISP_INFO("%s\n", __func__);
 	return ret;
@@ -963,12 +959,14 @@ static int __init mipi_video_sony_init(void)
 
 	strncat(ptype, "PANEL_ID_DLX_SONY_RENESAS", ptype_len);
 
-	video_on_cmds = sony_video_on_cmds;
-	video_on_cmds_count = ARRAY_SIZE(sony_video_on_cmds);
-	display_on_cmds = renesas_display_on_cmds;
-	display_on_cmds_count = ARRAY_SIZE(renesas_display_on_cmds);
-	display_off_cmds = sony_display_off_cmds;
-	display_off_cmds_count = ARRAY_SIZE(sony_display_off_cmds);
+	video_on_c.cmds = sony_video_on_cmds;
+	video_on_c.count = ARRAY_SIZE(sony_video_on_cmds);
+	display_on_c.cmds = renesas_display_on_cmds;
+	display_on_c.count = ARRAY_SIZE(renesas_display_on_cmds);
+	display_off_c.cmds = sony_display_off_cmds;
+	display_off_c.count = ARRAY_SIZE(sony_display_off_cmds);
+	backlight_c.cmds = renesas_cmd_backlight_cmds;
+	backlight_c.count = ARRAY_SIZE(renesas_cmd_backlight_cmds);
 
 	return ret;
 }
